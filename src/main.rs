@@ -11,10 +11,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use russh::client::{Config, Handler, Session};
-use russh_keys::key;
 use std::sync::Arc;
+use std::time::SystemTime;
+
+use russh::client::{Config, Handler};
+use russh_keys::key;
+
 #[derive(Parser, Debug)]
 #[command(name = "brass", author, version, about = "Brass Control")]
 pub struct Cli {
@@ -1507,7 +1509,7 @@ impl Commit {
             } else if let Some(comm) = line.strip_prefix("committer ") {
                 if let Some((name, email)) = comm.split_once(" <") {
                     committer.name = name.to_string();
-                    committer.email = email.trim_end_matches('>').to_string();
+                    committer.email = comm.trim_end_matches('>').to_string();
                 }
             }
         }
