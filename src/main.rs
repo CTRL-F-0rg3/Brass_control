@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-// enum
+use russh::client::{Config, Handler, Session};
+use russh_keys::key;
+use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(name = "brass", author, version, about = "Brass Control")]
 pub struct Cli {
@@ -21,7 +22,8 @@ pub struct Cli {
     pub command: Commands,
 }
 
-// enum
+struct ClientHandler;
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Init,
@@ -34,17 +36,57 @@ pub enum Commands {
         message: String,
     },
     Status,
+    Checkout {
+        #[arg(required = true)]
+        target: String,
+    },
+    Diff {
+        path: Option<PathBuf>,
+    },
     CatObject {
         #[arg(required = true)]
         hash: String,
     },
+    Tag {
+        #[command(subcommand)]
+        command: TagCommands,
+    },
+    Gc,
+    Pack,
     Leaf {
         #[command(subcommand)]
         command: LeafCommands,
     },
+    Log {
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+    },
+    Blame {
+        #[arg(required = true)]
+        path: PathBuf,
+    },
+    Push {
+        #[arg(required = true)]
+        remote: String,
+        #[arg(required = true)]
+        ref_name: String,
+    },
 }
 
-// enum
+#[derive(Subcommand, Debug)]
+pub enum TagCommands {
+    Create {
+        #[arg(required = true)]
+        name: String,
+        target: Option<String>,
+    },
+    List,
+    Delete {
+        #[arg(required = true)]
+        name: String,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum LeafCommands {
     Create {
@@ -58,13 +100,11 @@ pub enum LeafCommands {
     },
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blob {
     pub data: Vec<u8>,
 }
 
-// enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileMode {
     Regular,
@@ -72,7 +112,6 @@ pub enum FileMode {
     Directory,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {
     pub mode: FileMode,
@@ -80,13 +119,11 @@ pub struct TreeEntry {
     pub hash: String,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     pub entries: Vec<TreeEntry>,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
     pub name: String,
@@ -94,7 +131,6 @@ pub struct Signature {
     pub timestamp: SystemTime,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub tree_hash: String,
@@ -104,7 +140,6 @@ pub struct Commit {
     pub message: String,
 }
 
-// enum
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrassObject {
     Blob(Blob),
@@ -112,7 +147,6 @@ pub enum BrassObject {
     Commit(Commit),
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub path: PathBuf,
@@ -122,13 +156,11 @@ pub struct IndexEntry {
     pub file_size: u64,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Index {
     pub entries: Vec<IndexEntry>,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "brass_config")]
 pub struct BrassConfig {
@@ -138,9 +170,7 @@ pub struct BrassConfig {
     pub is_admin: bool,
 }
 
-// impl
 impl Default for BrassConfig {
-    // fn
     fn default() -> Self {
         Self {
             user_name: String::from("Anonymous"),
@@ -151,14 +181,12 @@ impl Default for BrassConfig {
     }
 }
 
-// enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessLevel {
     ReadOnly,
     ReadWrite,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessRule {
     pub user: String,
@@ -166,16 +194,13 @@ pub struct AccessRule {
     pub access: AccessLevel,
 }
 
-// struct
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename = "brass_acl")]
 pub struct AclConfig {
     pub rules: Vec<AccessRule>,
 }
 
-// impl
 impl AclConfig {
-    // fn
     pub fn load(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -184,13 +209,11 @@ impl AclConfig {
         from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    // fn
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let xml_str = to_string(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(path, xml_str)
     }
 
-    // fn
     pub fn can_write(&self, user: &str, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
         for rule in &self.rules {
@@ -205,47 +228,50 @@ impl AclConfig {
     }
 }
 
-// enum
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefKind {
     Branch(String),
     Leaf { user: String, name: String },
+    Tag(String),
 }
 
-// impl
 impl RefKind {
-    // fn
     pub fn to_path_suffix(&self) -> PathBuf {
         match self {
             RefKind::Branch(name) => PathBuf::from("refs").join("heads").join(name),
             RefKind::Leaf { user, name } => PathBuf::from("refs").join("leaves").join(user).join(name),
+            RefKind::Tag(name) => PathBuf::from("refs").join("tags").join(name),
         }
     }
 }
 
-// enum
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafMergeResult {
     Success(String),
     PermissionDenied { user: String, forbidden_path: PathBuf },
-    ConflictInLeaf {
-        path: PathBuf,
-        base_hash: Option<String>,
-        target_hash: Option<String>,
-        leaf_hash: Option<String>,
-    },
+    ConflictInLeaf { path: PathBuf },
 }
 
-// struct
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeChunk {
+    Clean(Vec<String>),
+    Conflict { target: Vec<String>, leaf: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffOp {
+    Keep(String),
+    Insert(String),
+    Delete(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct BrassIgnore {
     pub raw_patterns: Vec<String>,
     pub glob_set: GlobSet,
 }
 
-// impl
 impl Default for BrassIgnore {
-    // fn
     fn default() -> Self {
         let mut builder = GlobSetBuilder::new();
         builder.add(Glob::new(".brass_control/**").unwrap());
@@ -258,9 +284,7 @@ impl Default for BrassIgnore {
     }
 }
 
-// impl
 impl BrassIgnore {
-    // fn
     pub fn load(path: &Path) -> Self {
         let mut builder = GlobSetBuilder::new();
         let mut raw_patterns = Vec::new();
@@ -303,13 +327,11 @@ impl BrassIgnore {
         }
     }
 
-    // fn
     pub fn is_ignored(&self, path: &Path) -> bool {
         self.glob_set.is_match(path)
     }
 }
 
-// struct
 #[derive(Debug, Clone)]
 pub struct Repository {
     pub worktree: PathBuf,
@@ -319,15 +341,15 @@ pub struct Repository {
     pub acl: AclConfig,
 }
 
-// impl
 impl Repository {
-    // fn
     pub fn init(path: &Path) -> std::io::Result<Self> {
         let brass_dir = path.join(".brass_control");
 
         fs::create_dir_all(brass_dir.join("objects"))?;
+        fs::create_dir_all(brass_dir.join("packs"))?;
         fs::create_dir_all(brass_dir.join("refs").join("heads"))?;
         fs::create_dir_all(brass_dir.join("refs").join("leaves"))?;
+        fs::create_dir_all(brass_dir.join("refs").join("tags"))?;
 
         let head_path = brass_dir.join("HEAD");
         if !head_path.exists() {
@@ -363,7 +385,6 @@ impl Repository {
         })
     }
 
-    // fn
     pub fn write_object(&self, object: &BrassObject) -> std::io::Result<String> {
         let (hash, uncompressed_data) = object.serialize();
         let obj_dir = self.brass_dir.join("objects").join(&hash[..2]);
@@ -379,13 +400,20 @@ impl Repository {
         Ok(hash)
     }
 
-    // fn
     pub fn read_object(&self, hash: &str) -> std::io::Result<BrassObject> {
         let obj_path = self.brass_dir.join("objects").join(&hash[..2]).join(&hash[2..]);
-        let file = File::open(obj_path)?;
-        let mut decoder = ZlibDecoder::new(file);
-        let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)?;
+
+        let decompressed_data = if obj_path.exists() {
+            let file = File::open(obj_path)?;
+            let mut decoder = ZlibDecoder::new(file);
+            let mut buf = Vec::new();
+            decoder.read_to_end(&mut buf)?;
+            buf
+        } else if let Some(buf) = self.read_object_from_packs(hash)? {
+            buf
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Nie znaleziono obiektu: {}", hash)));
+        };
 
         let null_pos = decompressed_data
         .iter()
@@ -405,7 +433,41 @@ impl Repository {
         }
     }
 
-    // fn
+    fn read_object_from_packs(&self, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
+        let packs_dir = self.brass_dir.join("packs");
+        if !packs_dir.exists() {
+            return Ok(None);
+        }
+
+        for entry in fs::read_dir(packs_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("idx") {
+                let index_content = fs::read_to_string(&path)?;
+                for line in index_content.lines() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() == 3 && parts[0] == hash {
+                        let offset: u64 = parts[1].parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        let len: usize = parts[2].parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                        let pack_path = path.with_extension("pack");
+                        let mut pack_file = File::open(pack_path)?;
+                        pack_file.seek(SeekFrom::Start(offset))?;
+
+                        let mut compressed_buf = vec![0u8; len];
+                        pack_file.read_exact(&mut compressed_buf)?;
+
+                        let mut decoder = ZlibDecoder::new(&compressed_buf[..]);
+                        let mut decompressed = Vec::new();
+                        decoder.read_to_end(&mut decompressed)?;
+                        return Ok(Some(decompressed));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn add(&self, relative_path: &Path, index: &mut Index) -> std::io::Result<()> {
         if self.ignore.is_ignored(relative_path) {
             return Ok(());
@@ -446,7 +508,6 @@ impl Repository {
         Ok(())
     }
 
-    // fn
     pub fn commit(&self, message: String, author: Signature, index: &Index) -> std::io::Result<String> {
         let mut tree_entries = Vec::new();
         for entry in &index.entries {
@@ -472,51 +533,174 @@ impl Repository {
         Ok(commit_hash)
     }
 
-    // fn
-    pub fn create_leaf(&self, leaf_name: &str) -> std::io::Result<PathBuf> {
-        let current_head = self.get_head_commit_hash()?;
-        let leaf_ref = RefKind::Leaf {
-            user: self.config.user_name.clone(),
-            name: leaf_name.to_string(),
+    pub fn checkout(&self, target: &str) -> std::io::Result<()> {
+        let target_ref_path = if target.starts_with("tags/") {
+            self.brass_dir.join("refs").join(target)
+        } else if target.contains('/') {
+            self.brass_dir.join("refs").join("leaves").join(target)
+        } else {
+            let branch_path = self.brass_dir.join("refs").join("heads").join(target);
+            let tag_path = self.brass_dir.join("refs").join("tags").join(target);
+
+            if branch_path.exists() {
+                branch_path
+            } else if tag_path.exists() {
+                tag_path
+            } else {
+                PathBuf::new()
+            }
         };
 
-        let ref_path = self.brass_dir.join(leaf_ref.to_path_suffix());
-        if let Some(parent) = ref_path.parent() {
-            fs::create_dir_all(parent)?;
+        let commit_hash = if target_ref_path.exists() {
+            fs::read_to_string(&target_ref_path)?.trim().to_string()
+        } else if self.read_object(target).is_ok() {
+            target.to_string()
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Cel checkout nie istnieje"));
+        };
+
+        let target_files = self.flatten_tree_from_commit(&commit_hash)?;
+        let mut new_index = Index::default();
+
+        for (rel_path, hash) in &target_files {
+            if let Ok(BrassObject::Blob(blob)) = self.read_object(hash) {
+                let full_path = self.worktree.join(rel_path);
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&full_path, &blob.data)?;
+
+                let metadata = fs::metadata(&full_path)?;
+                new_index.entries.push(IndexEntry {
+                    path: rel_path.clone(),
+                                       hash: hash.clone(),
+                                       mode: FileMode::Regular,
+                                       modified_at: metadata.modified()?,
+                                       file_size: metadata.len(),
+                });
+            }
         }
 
-        fs::write(&ref_path, format!("{}\n", current_head))?;
-        fs::write(self.brass_dir.join("HEAD"), format!("ref: {}\n", leaf_ref.to_path_suffix().to_string_lossy()))?;
-
-        Ok(ref_path)
-    }
-
-    // fn
-    pub fn list_leaves(&self) -> std::io::Result<Vec<String>> {
-        let leaves_dir = self.brass_dir.join("refs").join("leaves");
-        let mut result = Vec::new();
-
-        if !leaves_dir.exists() {
-            return Ok(result);
-        }
-
-        for user_entry in fs::read_dir(leaves_dir)? {
-            let user_entry = user_entry?;
-            if user_entry.file_type()?.is_dir() {
-                let user_name = user_entry.file_name().to_string_lossy().to_string();
-                for leaf_entry in fs::read_dir(user_entry.path())? {
-                    let leaf_entry = leaf_entry?;
-                    if leaf_entry.file_type()?.is_file() {
-                        let leaf_name = leaf_entry.file_name().to_string_lossy().to_string();
-                        result.push(format!("{}/{}", user_name, leaf_name));
+        let current_head_hash = self.get_head_commit_hash().unwrap_or_default();
+        if let Ok(current_files) = self.flatten_tree_from_commit(&current_head_hash) {
+            for (rel_path, _) in current_files {
+                if !target_files.contains_key(&rel_path) {
+                    let full_path = self.worktree.join(&rel_path);
+                    if full_path.exists() {
+                        let _ = fs::remove_file(full_path);
                     }
                 }
             }
         }
-        Ok(result)
+
+        new_index.save(&self.brass_dir.join("index"))?;
+
+        if target_ref_path.exists() {
+            let rel_suffix = target_ref_path.strip_prefix(&self.brass_dir).unwrap_or(&target_ref_path);
+            fs::write(self.brass_dir.join("HEAD"), format!("ref: {}\n", rel_suffix.display()))?;
+        } else {
+            fs::write(self.brass_dir.join("HEAD"), format!("{}\n", commit_hash))?;
+        }
+
+        Ok(())
     }
 
-    // fn
+    pub fn diff(&self, target_path: Option<PathBuf>, index: &Index) -> std::io::Result<()> {
+        let index_map: HashMap<PathBuf, String> = index.entries.iter().map(|e| (e.path.clone(), e.hash.clone())).collect();
+
+        if let Some(path) = target_path {
+            self.diff_single_file(&path, index_map.get(&path))?;
+        } else {
+            for entry in &index.entries {
+                self.diff_single_file(&entry.path, Some(&entry.hash))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn diff_single_file(&self, path: &Path, index_hash: Option<&String>) -> std::io::Result<()> {
+        let full_path = self.worktree.join(path);
+        if !full_path.exists() {
+            println!("Deleted: {}", path.display());
+            return Ok(());
+        }
+
+        let disk_text = fs::read_to_string(&full_path)?;
+        let index_text = if let Some(hash) = index_hash {
+            if let Ok(BrassObject::Blob(blob)) = self.read_object(hash) {
+                String::from_utf8_lossy(&blob.data).to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let ops = self.compute_diff(&index_text, &disk_text);
+        let mut has_changes = false;
+
+        for op in &ops {
+            if !matches!(op, DiffOp::Keep(_)) {
+                has_changes = true;
+                break;
+            }
+        }
+
+        if has_changes {
+            println!("--- a/{}", path.display());
+            println!("+++ b/{}", path.display());
+            for op in ops {
+                match op {
+                    DiffOp::Keep(line) => println!(" {}", line),
+                    DiffOp::Insert(line) => println!("+{}", line),
+                    DiffOp::Delete(line) => println!("-{}", line),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compute_diff(&self, old_text: &str, new_text: &str) -> Vec<DiffOp> {
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let new_lines: Vec<&str> = new_text.lines().collect();
+
+        let n = old_lines.len();
+        let m = new_lines.len();
+        let mut lcs = vec![vec![0; m + 1]; n + 1];
+
+        for i in 0..n {
+            for j in 0..m {
+                if old_lines[i] == new_lines[j] {
+                    lcs[i + 1][j + 1] = lcs[i][j] + 1;
+                } else {
+                    lcs[i + 1][j + 1] = usize::max(lcs[i + 1][j], lcs[i][j + 1]);
+                }
+            }
+        }
+
+        let mut i = n;
+        let mut j = m;
+        let mut ops = Vec::new();
+
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 && old_lines[i - 1] == new_lines[j - 1] {
+                ops.push(DiffOp::Keep(old_lines[i - 1].to_string()));
+                i -= 1;
+                j -= 1;
+            } else if j > 0 && (i == 0 || lcs[i][j - 1] >= lcs[i - 1][j]) {
+                ops.push(DiffOp::Insert(new_lines[j - 1].to_string()));
+                j -= 1;
+            } else if i > 0 && (j == 0 || lcs[i][j - 1] < lcs[i - 1][j]) {
+                ops.push(DiffOp::Delete(old_lines[i - 1].to_string()));
+                i -= 1;
+            }
+        }
+
+        ops.reverse();
+        ops
+    }
+
     pub fn merge_leaf(&self, leaf_name: &str) -> std::io::Result<LeafMergeResult> {
         let target_commit_hash = self.get_head_commit_hash()?;
         let leaf_ref = RefKind::Leaf {
@@ -545,19 +729,18 @@ impl Repository {
         all_paths.extend(leaf_map.keys().cloned());
 
         let mut merged_entries = Vec::new();
+        let mut has_conflicts = false;
 
         for path in all_paths {
             let base_h = base_map.get(&path).cloned();
             let target_h = target_map.get(&path).cloned();
             let leaf_h = leaf_map.get(&path).cloned();
 
-            if leaf_h != base_h {
-                if !self.acl.can_write(&self.config.user_name, &path) {
-                    return Ok(LeafMergeResult::PermissionDenied {
-                        user: self.config.user_name.clone(),
-                              forbidden_path: path,
-                    });
-                }
+            if leaf_h != base_h && !self.acl.can_write(&self.config.user_name, &path) {
+                return Ok(LeafMergeResult::PermissionDenied {
+                    user: self.config.user_name.clone(),
+                          forbidden_path: path,
+                });
             }
 
             if target_h == leaf_h {
@@ -573,13 +756,30 @@ impl Repository {
                     merged_entries.push(TreeEntry { mode: FileMode::Regular, name: path.to_string_lossy().to_string(), hash: h });
                 }
             } else {
-                return Ok(LeafMergeResult::ConflictInLeaf {
-                    path,
-                    base_hash: base_h,
-                    target_hash: target_h,
-                    leaf_hash: leaf_h,
-                });
+                let base_text = self.read_blob_as_string(base_h.as_deref());
+                let target_text = self.read_blob_as_string(target_h.as_deref());
+                let leaf_text = self.read_blob_as_string(leaf_h.as_deref());
+
+                let chunks = self.three_way_line_merge(&base_text, &target_text, &leaf_text);
+                let (has_conflict, content) = self.format_merged_chunks(&chunks, leaf_name);
+
+                let full_path = self.worktree.join(&path);
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&full_path, &content)?;
+
+                if has_conflict {
+                    has_conflicts = true;
+                } else {
+                    let blob_hash = self.write_object(&BrassObject::Blob(Blob { data: content.into_bytes() }))?;
+                    merged_entries.push(TreeEntry { mode: FileMode::Regular, name: path.to_string_lossy().to_string(), hash: blob_hash });
+                }
             }
+        }
+
+        if has_conflicts {
+            return Ok(LeafMergeResult::ConflictInLeaf { path: PathBuf::from("Pliki z konfliktami zapisano na dysku") });
         }
 
         let merged_tree = BrassObject::Tree(Tree { entries: merged_entries });
@@ -607,7 +807,435 @@ impl Repository {
         Ok(LeafMergeResult::Success(new_commit_hash))
     }
 
-    // fn
+    fn read_blob_as_string(&self, hash: Option<&str>) -> String {
+        match hash {
+            Some(h) => {
+                if let Ok(BrassObject::Blob(blob)) = self.read_object(h) {
+                    String::from_utf8_lossy(&blob.data).to_string()
+                } else {
+                    String::new()
+                }
+            }
+            None => String::new(),
+        }
+    }
+
+    fn three_way_line_merge(&self, base: &str, target: &str, leaf: &str) -> Vec<MergeChunk> {
+        let base_lines: Vec<&str> = base.lines().collect();
+        let target_lines: Vec<&str> = target.lines().collect();
+        let leaf_lines: Vec<&str> = leaf.lines().collect();
+
+        if target == base {
+            return vec![MergeChunk::Clean(leaf_lines.iter().map(|s| s.to_string()).collect())];
+        }
+        if leaf == base || target == leaf {
+            return vec![MergeChunk::Clean(target_lines.iter().map(|s| s.to_string()).collect())];
+        }
+
+        let diff_target = self.compute_diff(base, target);
+        let diff_leaf = self.compute_diff(base, leaf);
+
+        if diff_target == diff_leaf {
+            return vec![MergeChunk::Clean(target_lines.iter().map(|s| s.to_string()).collect())];
+        }
+
+        let mut chunks = Vec::new();
+        let mut t_idx = 0;
+        let mut l_idx = 0;
+
+        while t_idx < target_lines.len() || l_idx < leaf_lines.len() {
+            if t_idx < target_lines.len() && l_idx < leaf_lines.len() && target_lines[t_idx] == leaf_lines[l_idx] {
+                chunks.push(MergeChunk::Clean(vec![target_lines[t_idx].to_string()]));
+                t_idx += 1;
+                l_idx += 1;
+            } else {
+                let mut t_conflict = Vec::new();
+                let mut l_conflict = Vec::new();
+
+                while t_idx < target_lines.len() && (l_idx >= leaf_lines.len() || target_lines[t_idx] != leaf_lines[l_idx]) {
+                    t_conflict.push(target_lines[t_idx].to_string());
+                    t_idx += 1;
+                }
+
+                while l_idx < leaf_lines.len() && (t_idx >= target_lines.len() || target_lines[t_idx] != leaf_lines[l_idx]) {
+                    l_conflict.push(leaf_lines[l_idx].to_string());
+                    l_idx += 1;
+                }
+
+                chunks.push(MergeChunk::Conflict {
+                    target: t_conflict,
+                    leaf: l_conflict,
+                });
+            }
+        }
+
+        chunks
+    }
+
+    fn format_merged_chunks(&self, chunks: &[MergeChunk], leaf_name: &str) -> (bool, String) {
+        let mut out = String::new();
+        let mut has_conflict = false;
+
+        for chunk in chunks {
+            match chunk {
+                MergeChunk::Clean(lines) => {
+                    for line in lines {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                MergeChunk::Conflict { target, leaf } => {
+                    has_conflict = true;
+                    out.push_str("<<<<<<< TARGET\n");
+                    for line in target {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    out.push_str("=======\n");
+                    for line in leaf {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    out.push_str(&format!(">>>>>>> LEAF ({})\n", leaf_name));
+                }
+            }
+        }
+
+        (has_conflict, out)
+    }
+
+    pub fn log(&self, limit: Option<usize>) -> std::io::Result<()> {
+        let mut current_hash = match self.get_head_commit_hash() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("Brak commitów w historii.");
+                return Ok(());
+            }
+        };
+
+        let mut count = 0;
+        let mut visited = HashSet::new();
+
+        while !current_hash.is_empty() {
+            if let Some(max) = limit {
+                if count >= max {
+                    break;
+                }
+            }
+
+            if !visited.insert(current_hash.clone()) {
+                break;
+            }
+
+            match self.read_object(&current_hash) {
+                Ok(BrassObject::Commit(commit)) => {
+                    println!("\x1b[33mcommit {}\x1b[0m", current_hash);
+                    if !commit.parent_hashes.is_empty() {
+                        println!("Parents: {}", commit.parent_hashes.join(" "));
+                    }
+                    println!("Author: {} <{}>", commit.author.name, commit.author.email);
+                    println!("\n    {}\n", commit.message);
+
+                    count += 1;
+                    if let Some(parent) = commit.parent_hashes.first() {
+                        current_hash = parent.clone();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn blame(&self, target_path: &Path) -> std::io::Result<()> {
+        let head_hash = self.get_head_commit_hash()?;
+        let disk_text = fs::read_to_string(self.worktree.join(target_path))?;
+        let lines: Vec<&str> = disk_text.lines().collect();
+
+        let mut line_authors: Vec<Option<(String, String)>> = vec![None; lines.len()];
+        let mut current_commit_hash = head_hash;
+
+        while !current_commit_hash.is_empty() {
+            if let Ok(BrassObject::Commit(commit)) = self.read_object(&current_commit_hash) {
+                let commit_files = self.flatten_tree_from_commit(&current_commit_hash)?;
+                if let Some(blob_hash) = commit_files.get(target_path) {
+                    let commit_text = self.read_blob_as_string(Some(blob_hash));
+                    let commit_lines: Vec<&str> = commit_text.lines().collect();
+
+                    for (idx, line) in lines.iter().enumerate() {
+                        if line_authors[idx].is_none() && commit_lines.contains(line) {
+                            let short_hash = &current_commit_hash[..7];
+                            let author_info = format!("{} ({})", short_hash, commit.author.name);
+                            line_authors[idx] = Some((author_info, line.to_string()));
+                        }
+                    }
+                }
+
+                if let Some(parent) = commit.parent_hashes.first() {
+                    current_commit_hash = parent.clone();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        println!("--- Blame dla {:?} ---", target_path);
+        for (idx, item) in line_authors.iter().enumerate() {
+            if let Some((info, line_content)) = item {
+                println!("{:4} | {:<25} | {}", idx + 1, info, line_content);
+            } else {
+                println!("{:4} | {:<25} | {}", idx + 1, "Uncommitted change", lines[idx]);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn create_tag(&self, name: &str, target_hash: Option<&str>) -> std::io::Result<PathBuf> {
+        let commit_hash = match target_hash {
+            Some(h) => h.to_string(),
+            None => self.get_head_commit_hash()?,
+        };
+
+        let tag_path = self.brass_dir.join("refs").join("tags").join(name);
+        if let Some(parent) = tag_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&tag_path, format!("{}\n", commit_hash))?;
+        Ok(tag_path)
+    }
+
+    pub fn list_tags(&self) -> std::io::Result<Vec<(String, String)>> {
+        let tags_dir = self.brass_dir.join("refs").join("tags");
+        let mut result = Vec::new();
+
+        if !tags_dir.exists() {
+            return Ok(result);
+        }
+
+        for entry in fs::read_dir(tags_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let hash = fs::read_to_string(entry.path())?.trim().to_string();
+                result.push((name, hash));
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn delete_tag(&self, name: &str) -> std::io::Result<()> {
+        let tag_path = self.brass_dir.join("refs").join("tags").join(name);
+        if tag_path.exists() {
+            fs::remove_file(tag_path)?;
+            Ok(())
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Tag nie istnieje"))
+        }
+    }
+
+    pub fn gc(&self) -> std::io::Result<usize> {
+        let reachable = self.collect_all_reachable_hashes()?;
+        let objects_dir = self.brass_dir.join("objects");
+        let mut removed_count = 0;
+
+        if !objects_dir.exists() {
+            return Ok(0);
+        }
+
+        for entry in fs::read_dir(&objects_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let prefix = entry.file_name().to_string_lossy().to_string();
+                for obj_entry in fs::read_dir(entry.path())? {
+                    let obj_entry = obj_entry?;
+                    let suffix = obj_entry.file_name().to_string_lossy().to_string();
+                    let full_hash = format!("{}{}", prefix, suffix);
+
+                    if !reachable.contains(&full_hash) {
+                        fs::remove_file(obj_entry.path())?;
+                        removed_count += 1;
+                    }
+                }
+
+                if fs::read_dir(entry.path())?.next().is_none() {
+                    let _ = fs::remove_dir(entry.path());
+                }
+            }
+        }
+
+        Ok(removed_count)
+    }
+
+    pub fn pack(&self) -> std::io::Result<(usize, PathBuf)> {
+        let objects_dir = self.brass_dir.join("objects");
+        if !objects_dir.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Katalog obiektów nie istnieje"));
+        }
+
+        let mut loose_objects = Vec::new();
+        for entry in fs::read_dir(&objects_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let prefix = entry.file_name().to_string_lossy().to_string();
+                for obj_entry in fs::read_dir(entry.path())? {
+                    let obj_entry = obj_entry?;
+                    let suffix = obj_entry.file_name().to_string_lossy().to_string();
+                    let full_hash = format!("{}{}", prefix, suffix);
+                    loose_objects.push((full_hash, obj_entry.path()));
+                }
+            }
+        }
+
+        if loose_objects.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Brak obiektów do spakowania"));
+        }
+
+        let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+        let pack_name = format!("pack-{}", timestamp);
+        let pack_path = self.brass_dir.join("packs").join(format!("{}.pack", pack_name));
+        let idx_path = self.brass_dir.join("packs").join(format!("{}.idx", pack_name));
+
+        fs::create_dir_all(self.brass_dir.join("packs"))?;
+
+        let mut pack_file = File::create(&pack_path)?;
+        let mut idx_file = File::create(&idx_path)?;
+
+        let mut current_offset: u64 = 0;
+        let mut packed_count = 0;
+
+        for (hash, path) in &loose_objects {
+            let compressed_data = fs::read(path)?;
+            let len = compressed_data.len();
+
+            pack_file.write_all(&compressed_data)?;
+            writeln!(idx_file, "{}\t{}\t{}", hash, current_offset, len)?;
+
+            current_offset += len as u64;
+            packed_count += 1;
+        }
+
+        for (_, path) in loose_objects {
+            let _ = fs::remove_file(&path);
+        }
+
+        Ok((packed_count, pack_path))
+    }
+
+    fn collect_all_reachable_hashes(&self) -> std::io::Result<HashSet<String>> {
+        let mut reachable = HashSet::new();
+        let mut root_hashes = Vec::new();
+
+        if let Ok(head_hash) = self.get_head_commit_hash() {
+            root_hashes.push(head_hash);
+        }
+
+        let refs_dir = self.brass_dir.join("refs");
+        if refs_dir.exists() {
+            self.collect_refs_from_dir(&refs_dir, &mut root_hashes)?;
+        }
+
+        let index_path = self.brass_dir.join("index");
+        if let Ok(index) = Index::load(&index_path) {
+            for entry in index.entries {
+                reachable.insert(entry.hash);
+            }
+        }
+
+        let mut queue = VecDeque::from(root_hashes);
+        while let Some(hash) = queue.pop_front() {
+            if reachable.insert(hash.clone()) {
+                if let Ok(obj) = self.read_object(&hash) {
+                    match obj {
+                        BrassObject::Commit(commit) => {
+                            queue.push_back(commit.tree_hash);
+                            for p in commit.parent_hashes {
+                                queue.push_back(p);
+                            }
+                        }
+                        BrassObject::Tree(tree) => {
+                            for entry in tree.entries {
+                                queue.push_back(entry.hash);
+                            }
+                        }
+                        BrassObject::Blob(_) => {}
+                    }
+                }
+            }
+        }
+
+        Ok(reachable)
+    }
+
+    fn collect_refs_from_dir(&self, dir: &Path, root_hashes: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                self.collect_refs_from_dir(&path, root_hashes)?;
+            } else if path.is_file() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let hash = content.trim().to_string();
+                    if !hash.is_empty() && !hash.starts_with("ref: ") {
+                        root_hashes.push(hash);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn create_leaf(&self, leaf_name: &str) -> std::io::Result<PathBuf> {
+        let current_head = self.get_head_commit_hash()?;
+        let leaf_ref = RefKind::Leaf {
+            user: self.config.user_name.clone(),
+            name: leaf_name.to_string(),
+        };
+
+        let ref_path = self.brass_dir.join(leaf_ref.to_path_suffix());
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&ref_path, format!("{}\n", current_head))?;
+        fs::write(self.brass_dir.join("HEAD"), format!("ref: {}\n", leaf_ref.to_path_suffix().to_string_lossy()))?;
+
+        Ok(ref_path)
+    }
+
+    pub fn list_leaves(&self) -> std::io::Result<Vec<String>> {
+        let leaves_dir = self.brass_dir.join("refs").join("leaves");
+        let mut result = Vec::new();
+
+        if !leaves_dir.exists() {
+            return Ok(result);
+        }
+
+        for user_entry in fs::read_dir(leaves_dir)? {
+            let user_entry = user_entry?;
+            if user_entry.file_type()?.is_dir() {
+                let user_name = user_entry.file_name().to_string_lossy().to_string();
+                for leaf_entry in fs::read_dir(user_entry.path())? {
+                    let leaf_entry = leaf_entry?;
+                    if leaf_entry.file_type()?.is_file() {
+                        let leaf_name = leaf_entry.file_name().to_string_lossy().to_string();
+                        result.push(format!("{}/{}", user_name, leaf_name));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn status(&self, index: &Index) -> std::io::Result<()> {
         let mut head_files = HashMap::new();
         if let Ok(head_hash) = self.get_head_commit_hash() {
@@ -653,7 +1281,6 @@ impl Repository {
         Ok(())
     }
 
-    // fn
     fn scan_worktree(
         &self,
         base_dir: &Path,
@@ -690,7 +1317,6 @@ impl Repository {
         Ok(())
     }
 
-    // fn
     fn flatten_tree_from_commit(&self, commit_hash: &str) -> std::io::Result<HashMap<PathBuf, String>> {
         let mut result = HashMap::new();
         if let Ok(BrassObject::Commit(commit)) = self.read_object(commit_hash) {
@@ -699,7 +1325,6 @@ impl Repository {
         Ok(result)
     }
 
-    // fn
     fn collect_tree_entries(&self, tree_hash: &str, prefix: &Path, map: &mut HashMap<PathBuf, String>) -> std::io::Result<()> {
         if let Ok(BrassObject::Tree(tree)) = self.read_object(tree_hash) {
             for entry in tree.entries {
@@ -714,7 +1339,6 @@ impl Repository {
         Ok(())
     }
 
-    // fn
     fn find_lca(&self, commit_a: &str, commit_b: &str) -> std::io::Result<Option<String>> {
         let mut ancestors_a = HashSet::new();
         let mut queue = VecDeque::new();
@@ -749,7 +1373,6 @@ impl Repository {
         Ok(None)
     }
 
-    // fn
     fn get_head_commit_hash(&self) -> std::io::Result<String> {
         let head_content = fs::read_to_string(self.brass_dir.join("HEAD"))?;
         let head_content = head_content.trim();
@@ -763,7 +1386,6 @@ impl Repository {
         }
     }
 
-    // fn
     fn update_head_target(&self, commit_hash: &str) -> std::io::Result<()> {
         let head_content = fs::read_to_string(self.brass_dir.join("HEAD"))?;
         let head_content = head_content.trim();
@@ -781,9 +1403,7 @@ impl Repository {
     }
 }
 
-// impl
 impl BrassObject {
-    // fn
     pub fn serialize(&self) -> (String, Vec<u8>) {
         let (kind_str, payload) = match self {
             BrassObject::Blob(b) => ("blob", b.data.clone()),
@@ -801,9 +1421,7 @@ impl BrassObject {
     }
 }
 
-// impl
 impl Tree {
-    // fn
     pub fn serialize_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for entry in &self.entries {
@@ -813,7 +1431,6 @@ impl Tree {
         buf
     }
 
-    // fn
     pub fn deserialize_payload(payload: &[u8]) -> std::io::Result<Self> {
         let mut entries = Vec::new();
         let reader = BufReader::new(payload);
@@ -840,9 +1457,7 @@ impl Tree {
     }
 }
 
-// impl
 impl Commit {
-    // fn
     pub fn serialize_payload(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("tree {}\n", self.tree_hash));
@@ -855,7 +1470,6 @@ impl Commit {
         out
     }
 
-    // fn
     pub fn deserialize_payload(payload: &[u8]) -> std::io::Result<Self> {
         let content = String::from_utf8_lossy(payload);
         let mut tree_hash = String::new();
@@ -908,9 +1522,7 @@ impl Commit {
     }
 }
 
-// impl
 impl Index {
-    // fn
     pub fn load(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -944,7 +1556,6 @@ impl Index {
         Ok(Self { entries })
     }
 
-    // fn
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut file = File::create(path)?;
         for entry in &self.entries {
@@ -959,22 +1570,58 @@ impl Index {
     }
 }
 
-// impl
 impl BrassConfig {
-    // fn
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let content = fs::read_to_string(path)?;
         from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    // fn
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let xml_str = to_string(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(path, xml_str)
     }
 }
 
-// fn
+#[async_trait::async_trait]
+impl Handler for ClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true) // Akceptujemy klucz serwera w środowisku lokalnym
+    }
+}
+
+pub async fn network_push_pack(
+    server_addr: &str,
+    pack_data: &[u8],
+    remote_ref: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(Config::default());
+    let mut session = russh::client::connect(config, server_addr, ClientHandler).await?;
+
+    // Logowanie anonimowe/kluczem
+    let _ = session.authenticate_password("brass_user", "").await?;
+
+    let mut channel = session.channel_open_session().await?;
+    let cmd = format!("brass-receive-pack {}", remote_ref);
+    channel.exec(true, cmd.as_bytes()).await?;
+
+    // Przesyłamy wygenerowaną paczkę obiektów z brass_control
+    channel.data(&pack_data[..]).await?;
+    channel.eof().await?;
+
+    while let Some(msg) = channel.wait().await {
+        if let russh::ChannelMsg::Data { data } = msg {
+            print!("[REMOTE] {}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let current_dir = std::env::current_dir().unwrap();
@@ -1021,6 +1668,22 @@ fn main() {
                 eprintln!("Błąd statusu: {}", e);
             }
         }
+        Commands::Checkout { target } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            match repo.checkout(&target) {
+                Ok(_) => println!("Przełączono stan roboczy na: {}", target),
+                Err(e) => eprintln!("Błąd checkout: {}", e),
+            }
+        }
+        Commands::Diff { path } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            let index_path = repo.brass_dir.join("index");
+            let index = Index::load(&index_path).unwrap_or_default();
+
+            if let Err(e) = repo.diff(path, &index) {
+                eprintln!("Błąd wyliczania diff: {}", e);
+            }
+        }
         Commands::CatObject { hash } => {
             let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
             match repo.read_object(&hash) {
@@ -1036,6 +1699,42 @@ fn main() {
                     println!("\n{}", c.message);
                 }
                 Err(e) => eprintln!("Nie udało się odczytać obiektu: {}", e),
+            }
+        }
+        Commands::Tag { command } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            match command {
+                TagCommands::Create { name, target } => match repo.create_tag(&name, target.as_deref()) {
+                    Ok(path) => println!("Utworzono Tag '{}' pod {:?}", name, path),
+                    Err(e) => eprintln!("Błąd tworzenia taga: {}", e),
+                },
+                TagCommands::List => match repo.list_tags() {
+                    Ok(tags) => {
+                        println!("--- Tagi / Release ---");
+                        for (tag, hash) in tags {
+                            println!("  {} -> {}", tag, hash);
+                        }
+                    }
+                    Err(e) => eprintln!("Błąd listowania tagów: {}", e),
+                },
+                TagCommands::Delete { name } => match repo.delete_tag(&name) {
+                    Ok(_) => println!("Usunięto Tag '{}'", name),
+                    Err(e) => eprintln!("Błąd usuwania taga: {}", e),
+                },
+            }
+        }
+        Commands::Gc => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            match repo.gc() {
+                Ok(count) => println!("Garbage Collection: usunięto {} osieroconych obiektów z dysku", count),
+                Err(e) => eprintln!("Błąd podczas wykonywania GC: {}", e),
+            }
+        }
+        Commands::Pack => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            match repo.pack() {
+                Ok((count, path)) => println!("Spakowano {} luźnych obiektów do paczki {:?}", count, path),
+                Err(e) => eprintln!("Błąd pakowania obiektów: {}", e),
             }
         }
         Commands::Leaf { command } => {
@@ -1059,11 +1758,41 @@ fn main() {
                     Ok(LeafMergeResult::PermissionDenied { user, forbidden_path }) => {
                         eprintln!("Brak uprawnień ACL dla użytkownika '{}' na ścieżce {:?}", user, forbidden_path);
                     }
-                    Ok(LeafMergeResult::ConflictInLeaf { path, .. }) => {
-                        eprintln!("Konflikt scalania w pliku: {:?}", path);
+                    Ok(LeafMergeResult::ConflictInLeaf { .. }) => {
+                        eprintln!("Wystąpiły konflikty podczas scalania. Markery konfliktów zapisano w plikach roboczych.");
                     }
                     Err(e) => eprintln!("Błąd podczas scalania Liścia: {}", e),
                 },
+            }
+        }
+        Commands::Log { limit } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            if let Err(e) = repo.log(limit) {
+                eprintln!("Błąd wyświetlania logu: {}", e);
+            }
+        }
+        Commands::Blame { path } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            if let Err(e) = repo.blame(&path) {
+                eprintln!("Błąd podczas blame: {}", e);
+            }
+        }
+        Commands::Push { remote, ref_name } => {
+            let repo = Repository::init(&current_dir).expect("Nie znaleziono repozytorium");
+            match repo.pack() {
+                Ok((_count, pack_path)) => {
+                    let pack_bytes = fs::read(&pack_path).expect("Błąd odczytu spakowanego pliku");
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        println!("Wysyłanie paczki na serwer {}...", remote);
+                        if let Err(e) = network_push_pack(&remote, &pack_bytes, &ref_name).await {
+                            eprintln!("Błąd podczas pushowania: {}", e);
+                        } else {
+                            println!("Pomyślnie wysłano dane na serwer.");
+                        }
+                    });
+                }
+                Err(e) => eprintln!("Nie udało się spakować obiektów przed wysłaniem: {}", e),
             }
         }
     }
