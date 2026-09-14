@@ -483,6 +483,38 @@ impl Repository {
         }
 
         let full_path = self.worktree.join(relative_path);
+        let metadata = fs::metadata(&full_path)?;
+
+        if metadata.is_dir() {
+            let mut queue = VecDeque::new();
+            queue.push_back(relative_path.to_path_buf());
+
+            while let Some(current_rel) = queue.pop_front() {
+                let current_full = self.worktree.join(&current_rel);
+                for entry in fs::read_dir(current_full)? {
+                    let entry = entry?;
+                    let child_rel = current_rel.join(entry.file_name());
+
+                    if self.ignore.is_ignored(&child_rel) {
+                        continue;
+                    }
+
+                    let ft = entry.file_type()?;
+                    if ft.is_dir() {
+                        queue.push_back(child_rel);
+                    } else if ft.is_file() {
+                        self.add_single_file(&child_rel, index)?;
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            self.add_single_file(relative_path, index)
+        }
+    }
+
+    fn add_single_file(&self, relative_path: &Path, index: &mut Index) -> std::io::Result<()> {
+        let full_path = self.worktree.join(relative_path);
         let data = fs::read(&full_path)?;
         let metadata = fs::metadata(&full_path)?;
 
@@ -1178,17 +1210,22 @@ impl Repository {
         Ok(reachable)
     }
 
-    fn collect_refs_from_dir(&self, dir: &Path, root_hashes: &mut Vec<String>) -> std::io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                self.collect_refs_from_dir(&path, root_hashes)?;
-            } else if path.is_file() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let hash = content.trim().to_string();
-                    if !hash.is_empty() && !hash.starts_with("ref: ") {
-                        root_hashes.push(hash);
+    fn collect_refs_from_dir(&self, root_dir: &Path, root_hashes: &mut Vec<String>) -> std::io::Result<()> {
+        let mut queue = VecDeque::new();
+        queue.push_back(root_dir.to_path_buf());
+
+        while let Some(current_dir) = queue.pop_front() {
+            for entry in fs::read_dir(current_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    queue.push_back(path);
+                } else if path.is_file() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let hash = content.trim().to_string();
+                        if !hash.is_empty() && !hash.starts_with("ref: ") {
+                            root_hashes.push(hash);
+                        }
                     }
                 }
             }
@@ -1222,15 +1259,19 @@ impl Repository {
             return Ok(result);
         }
 
-        for user_entry in fs::read_dir(leaves_dir)? {
-            let user_entry = user_entry?;
-            if user_entry.file_type()?.is_dir() {
-                let user_name = user_entry.file_name().to_string_lossy().to_string();
-                for leaf_entry in fs::read_dir(user_entry.path())? {
-                    let leaf_entry = leaf_entry?;
-                    if leaf_entry.file_type()?.is_file() {
-                        let leaf_name = leaf_entry.file_name().to_string_lossy().to_string();
-                        result.push(format!("{}/{}", user_name, leaf_name));
+        let mut queue = VecDeque::new();
+        queue.push_back(leaves_dir);
+
+        while let Some(current_dir) = queue.pop_front() {
+            for entry in fs::read_dir(current_dir)? {
+                let entry = entry?;
+                let ft = entry.file_type()?;
+
+                if ft.is_dir() {
+                    queue.push_back(entry.path());
+                } else if ft.is_file() {
+                    if let Ok(rel_path) = entry.path().strip_prefix(self.brass_dir.join("refs").join("leaves")) {
+                        result.push(rel_path.to_string_lossy().to_string());
                     }
                 }
             }
@@ -1257,7 +1298,7 @@ impl Repository {
         }
 
         let mut untracked = Vec::new();
-        self.scan_worktree(&self.worktree, Path::new(""), index, &mut unstaged_entries, &mut untracked)?;
+        self.scan_worktree(&self.worktree, index, &mut unstaged_entries, &mut untracked)?;
 
         for (head_path, _) in head_files {
             if !index_map.contains_key(&head_path) {
@@ -1286,33 +1327,37 @@ impl Repository {
     fn scan_worktree(
         &self,
         base_dir: &Path,
-        rel_dir: &Path,
         index: &Index,
         unstaged: &mut Vec<(PathBuf, &'static str)>,
                      untracked: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
-        let current_dir = base_dir.join(rel_dir);
-        for entry in fs::read_dir(current_dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let rel_path = rel_dir.join(file_name);
+        let mut queue = VecDeque::new();
+        queue.push_back(PathBuf::new());
 
-            if self.ignore.is_ignored(&rel_path) {
-                continue;
-            }
+        while let Some(rel_dir) = queue.pop_front() {
+            let current_dir = base_dir.join(&rel_dir);
+            for entry in fs::read_dir(current_dir)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                let rel_path = rel_dir.join(file_name);
 
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                self.scan_worktree(base_dir, &rel_path, index, unstaged, untracked)?;
-            } else if file_type.is_file() {
-                if let Some(idx_entry) = index.entries.iter().find(|e| e.path == rel_path) {
-                    let disk_data = fs::read(base_dir.join(&rel_path))?;
-                    let (disk_hash, _) = BrassObject::Blob(Blob { data: disk_data }).serialize();
-                    if disk_hash != idx_entry.hash {
-                        unstaged.push((rel_path, "modified"));
+                if self.ignore.is_ignored(&rel_path) {
+                    continue;
+                }
+
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    queue.push_back(rel_path);
+                } else if file_type.is_file() {
+                    if let Some(idx_entry) = index.entries.iter().find(|e| e.path == rel_path) {
+                        let disk_data = fs::read(base_dir.join(&rel_path))?;
+                        let (disk_hash, _) = BrassObject::Blob(Blob { data: disk_data }).serialize();
+                        if disk_hash != idx_entry.hash {
+                            unstaged.push((rel_path, "modified"));
+                        }
+                    } else {
+                        untracked.push(rel_path);
                     }
-                } else {
-                    untracked.push(rel_path);
                 }
             }
         }
@@ -1322,19 +1367,24 @@ impl Repository {
     fn flatten_tree_from_commit(&self, commit_hash: &str) -> std::io::Result<HashMap<PathBuf, String>> {
         let mut result = HashMap::new();
         if let Ok(BrassObject::Commit(commit)) = self.read_object(commit_hash) {
-            self.collect_tree_entries(&commit.tree_hash, Path::new(""), &mut result)?;
+            self.collect_tree_entries(&commit.tree_hash, &mut result)?;
         }
         Ok(result)
     }
 
-    fn collect_tree_entries(&self, tree_hash: &str, prefix: &Path, map: &mut HashMap<PathBuf, String>) -> std::io::Result<()> {
-        if let Ok(BrassObject::Tree(tree)) = self.read_object(tree_hash) {
-            for entry in tree.entries {
-                let path = prefix.join(&entry.name);
-                if entry.mode == FileMode::Directory {
-                    self.collect_tree_entries(&entry.hash, &path, map)?;
-                } else {
-                    map.insert(path, entry.hash);
+    fn collect_tree_entries(&self, initial_tree_hash: &str, map: &mut HashMap<PathBuf, String>) -> std::io::Result<()> {
+        let mut queue = VecDeque::new();
+        queue.push_back((initial_tree_hash.to_string(), PathBuf::new()));
+
+        while let Some((tree_hash, prefix)) = queue.pop_front() {
+            if let Ok(BrassObject::Tree(tree)) = self.read_object(&tree_hash) {
+                for entry in tree.entries {
+                    let path = prefix.join(&entry.name);
+                    if entry.mode == FileMode::Directory {
+                        queue.push_back((entry.hash, path));
+                    } else {
+                        map.insert(path, entry.hash);
+                    }
                 }
             }
         }
@@ -1592,7 +1642,7 @@ impl Handler for ClientHandler {
         &mut self,
         _server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true) // Akceptujemy klucz serwera w środowisku lokalnym
+        Ok(true)
     }
 }
 
@@ -1602,16 +1652,15 @@ pub async fn network_push_pack(
     remote_ref: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::default());
-    let mut session = russh::client::connect(config, server_addr, ClientHandler).await?;
+    let addrs: Vec<_> = tokio::net::lookup_host(server_addr).await?.collect();
+    let mut handle = russh::client::connect(config, &addrs[..], ClientHandler).await?;
 
-    // Logowanie anonimowe/kluczem
-    let _ = session.authenticate_password("brass_user", "").await?;
+    let _ = handle.authenticate_password("brass_user", "").await?;
 
-    let mut channel = session.channel_open_session().await?;
+    let mut channel = handle.channel_open_session().await?;
     let cmd = format!("brass-receive-pack {}", remote_ref);
     channel.exec(true, cmd.as_bytes()).await?;
 
-    // Przesyłamy wygenerowaną paczkę obiektów z brass_control
     channel.data(&pack_data[..]).await?;
     channel.eof().await?;
 
